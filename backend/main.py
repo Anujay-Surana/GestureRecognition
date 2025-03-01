@@ -34,7 +34,7 @@ hands = mp_hands.Hands(
 )
 mp_drawing = mp.solutions.drawing_utils
 
-# Global variables for volume gesture control, dynamic gesture detection, and cursor control
+# Global variables for gesture control
 last_volume_gesture_time = 0
 volume_gesture_cooldown = 1  # seconds
 previous_static_gesture = None  # To avoid repeated volume commands
@@ -45,12 +45,17 @@ dynamic_gesture_cooldown = 1  # seconds
 
 previous_cursor_center = None  # Used for cursor control with fist
 
+# Added for Rock On gesture for music control
+last_music_gesture_time = 0
+music_gesture_cooldown = 2.0  # longer cooldown for music control
+
 # Detect platform
 current_platform = platform.system()
 
 # -----------------------
-# Volume & Window Functions
+# Media Control Functions
 # -----------------------
+
 if current_platform == "Windows":
     # Volume control functions for Windows using ctypes
     def volume_up_windows():
@@ -64,6 +69,12 @@ if current_platform == "Windows":
         WM_APPCOMMAND = 0x0319
         APPCOMMAND_VOLUME_DOWN = 0x09
         ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_APPCOMMAND, 0, APPCOMMAND_VOLUME_DOWN << 16)
+        
+    def play_pause_music_windows():
+        HWND_BROADCAST = 0xFFFF
+        WM_APPCOMMAND = 0x0319
+        APPCOMMAND_MEDIA_PLAY_PAUSE = 0x0E
+        ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_APPCOMMAND, 0, APPCOMMAND_MEDIA_PLAY_PAUSE << 16)
 
     def minimize_current_window():
         hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -80,6 +91,9 @@ if current_platform == "Windows":
 
     def volume_down():
         volume_down_windows()
+        
+    def play_pause_music():
+        play_pause_music_windows()
 
     # Cursor control for Windows using ctypes (win32 API)
     import ctypes.wintypes
@@ -112,6 +126,10 @@ elif current_platform == "Darwin":
             current_volume = 50
         new_volume = max(current_volume - 5, 0)
         subprocess.run(f"osascript -e 'set volume output volume {new_volume}'", shell=True)
+        
+    def play_pause_music_mac():
+        # Using AppleScript to send play/pause to the current music app
+        subprocess.run("osascript -e 'tell application \"System Events\" to keystroke space'", shell=True)
 
     def minimize_current_window():
         subprocess.run("osascript -e 'tell application \"System Events\" to keystroke \"m\" using {command down}'", shell=True)
@@ -124,6 +142,9 @@ elif current_platform == "Darwin":
 
     def volume_down():
         volume_down_mac()
+        
+    def play_pause_music():
+        play_pause_music_mac()
 
     # Cursor control for macOS using pyautogui
     def move_cursor_mac(dx, dy):
@@ -141,6 +162,8 @@ else:
         print("Volume up not supported on this platform")
     def volume_down():
         print("Volume down not supported on this platform")
+    def play_pause_music():
+        print("Play/pause music not supported on this platform")
     def minimize_current_window():
         print("Window minimize not supported on this platform")
     def maximize_current_window():
@@ -159,6 +182,7 @@ def detect_static_gesture(hand_landmarks, frame):
       - "Fist": All four non-thumb fingers folded.
       - "Thumbs Up": All non-thumb fingers folded and thumb pointing upward.
       - "Thumbs Down": All non-thumb fingers folded and thumb pointing downward.
+      - "Rock On": Index and pinky fingers extended, other fingers folded.
     """
     landmarks = hand_landmarks.landmark
     h, w, _ = frame.shape
@@ -166,28 +190,38 @@ def detect_static_gesture(hand_landmarks, frame):
     def finger_extended(tip_idx, pip_idx):
         return landmarks[tip_idx].y < landmarks[pip_idx].y
 
+    # Check extension of each finger
     index_extended = finger_extended(8, 6)
     middle_extended = finger_extended(12, 10)
     ring_extended = finger_extended(16, 14)
     pinky_extended = finger_extended(20, 18)
-    extended_count = sum([index_extended, middle_extended, ring_extended, pinky_extended])
     
+    # Calculate thumb position for thumb gestures
     thumb_mcp = landmarks[2]
     thumb_tip = landmarks[4]
     dx = thumb_tip.x - thumb_mcp.x
     dy = thumb_tip.y - thumb_mcp.y
     angle = math.degrees(math.atan2(dy, dx))
     threshold_angle = 20  # degrees tolerance
-
-    if extended_count == 4:
+    
+    # Rock On gesture: index and pinky extended, others folded
+    if index_extended and not middle_extended and not ring_extended and pinky_extended:
+        return "Rock On"
+    
+    # Open Palm: all four fingers extended
+    elif index_extended and middle_extended and ring_extended and pinky_extended:
         return "Open Palm"
-    elif extended_count == 0:
+    
+    # Fist, Thumbs Up, Thumbs Down: no fingers extended, thumb position matters
+    elif not index_extended and not middle_extended and not ring_extended and not pinky_extended:
         if thumb_tip.y < thumb_mcp.y and abs(angle + 90) < threshold_angle:
             return "Thumbs Up"
         elif thumb_tip.y > thumb_mcp.y and abs(angle - 90) < threshold_angle:
             return "Thumbs Down"
         else:
             return "Fist"
+    
+    # None of the above patterns matched
     else:
         return None
 
@@ -227,13 +261,18 @@ def detect_dynamic_gesture(bbox, current_time):
 # Frame Processing Function
 # -----------------------
 def process_frame(frame):
-    global last_volume_gesture_time, previous_static_gesture, previous_cursor_center
+    global last_volume_gesture_time, previous_static_gesture, previous_cursor_center, last_music_gesture_time
     current_time = time.time()
     frame = cv2.flip(frame, 1)
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb_frame)
     bbox_for_dynamic = None
     h, w, _ = frame.shape
+
+    # Add instruction text at the top of the frame
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(frame, "Thumbs Up: Volume Up | Open Palm: Volume Down | Rock On: Play/Pause", 
+                (10, 30), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
     if results.multi_hand_landmarks:
         for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
@@ -256,7 +295,11 @@ def process_frame(frame):
             # Detect static gesture for this hand.
             gesture = detect_static_gesture(hand_landmarks, frame)
             if gesture:
-                # Only trigger volume control when the gesture first appears.
+                # Overlay the static gesture name on the frame.
+                text_y = y_min - 10 if y_min - 10 > 20 else y_min + 30
+                cv2.putText(frame, gesture, (x_min, text_y), font, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+                
+                # Handle volume control gestures
                 if gesture in ["Thumbs Up", "Open Palm"]:
                     if previous_static_gesture != gesture and (current_time - last_volume_gesture_time > volume_gesture_cooldown):
                         if gesture == "Thumbs Up":
@@ -266,31 +309,35 @@ def process_frame(frame):
                             volume_down()
                             print("Volume decreased")
                         last_volume_gesture_time = current_time
-                    previous_static_gesture = gesture
-                else:
-                    previous_static_gesture = gesture
-
-                # Overlay the static gesture name on the frame.
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                text_y = y_min - 10 if y_min - 10 > 20 else y_min + 30
-                cv2.putText(frame, gesture, (x_min, text_y), font, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+                
+                # Handle Rock On gesture for music play/pause
+                elif gesture == "Rock On":
+                    if (current_time - last_music_gesture_time > music_gesture_cooldown):
+                        play_pause_music()
+                        print("Music play/pause toggled")
+                        last_music_gesture_time = current_time
+                        
+                        # Add visual feedback for music toggle
+                        cv2.putText(frame, "Music Toggled!", (x_min, text_y + 40), 
+                                    font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                
+                previous_static_gesture = gesture
             else:
                 previous_static_gesture = None
 
             # Cursor control: if this is the first detected hand and it shows a "Fist" gesture,
             # use the center of the fist (the bounding box center) to slowly move the cursor.
-            if idx == 0:
-                if gesture == "Fist":
-                    fist_center = ((x_min + x_max) // 2, (y_min + y_max) // 2)
-                    if previous_cursor_center is not None:
-                        dx = fist_center[0] - previous_cursor_center[0]
-                        dy = fist_center[1] - previous_cursor_center[1]
-                        # Scale the movement so the cursor moves slowly (like a TV remote)
-                        scale_factor = 0.5
-                        move_cursor(dx * scale_factor, dy * scale_factor)
-                    previous_cursor_center = fist_center
-                else:
-                    previous_cursor_center = None
+            if idx == 0 and gesture == "Fist":
+                fist_center = ((x_min + x_max) // 2, (y_min + y_max) // 2)
+                if previous_cursor_center is not None:
+                    dx = fist_center[0] - previous_cursor_center[0]
+                    dy = fist_center[1] - previous_cursor_center[1]
+                    # Scale the movement so the cursor moves slowly (like a TV remote)
+                    scale_factor = 0.5
+                    move_cursor(dx * scale_factor, dy * scale_factor)
+                previous_cursor_center = fist_center
+            else:
+                previous_cursor_center = None
 
     # Dynamic gesture detection (swipe gestures)
     if bbox_for_dynamic is not None:
@@ -328,6 +375,21 @@ def generate_frames():
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     finally:
         cap.release()
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Gesture Control API",
+        "instructions": "Access video feed at /video_feed",
+        "gestures": {
+            "Thumbs Up": "Increase volume",
+            "Open Palm": "Decrease volume",
+            "Rock On": "Play/pause music",
+            "Fist": "Move cursor",
+            "Swipe Up": "Maximize window",
+            "Swipe Down": "Minimize window"
+        }
+    }
 
 @app.get("/video_feed")
 async def video_feed():
