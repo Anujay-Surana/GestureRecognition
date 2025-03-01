@@ -47,7 +47,10 @@ previous_cursor_center = None  # Used for cursor control with fist
 
 # Added for Rock On gesture for music control
 last_music_gesture_time = 0
-music_gesture_cooldown = 2.0  # longer cooldown for music control
+music_gesture_cooldown = 3.0  # Increased to 3 seconds
+rock_on_start_time = 0  # When the Rock On gesture was first detected
+rock_on_hold_threshold = 1.5  # Hold the gesture for 1.5 seconds to activate
+rock_on_state = "none"  # Track the state of rock on detection: "none", "holding", "triggered"
 
 # Detect platform
 current_platform = platform.system()
@@ -261,7 +264,8 @@ def detect_dynamic_gesture(bbox, current_time):
 # Frame Processing Function
 # -----------------------
 def process_frame(frame):
-    global last_volume_gesture_time, previous_static_gesture, previous_cursor_center, last_music_gesture_time
+    global last_volume_gesture_time, previous_static_gesture, previous_cursor_center
+    global last_music_gesture_time, rock_on_start_time, rock_on_state
     current_time = time.time()
     frame = cv2.flip(frame, 1)
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -310,20 +314,67 @@ def process_frame(frame):
                             print("Volume decreased")
                         last_volume_gesture_time = current_time
                 
-                # Handle Rock On gesture for music play/pause
+                # Handle Rock On gesture for music play/pause with hold detection
                 elif gesture == "Rock On":
-                    if (current_time - last_music_gesture_time > music_gesture_cooldown):
-                        play_pause_music()
-                        print("Music play/pause toggled")
-                        last_music_gesture_time = current_time
+                    # Check cooldown first - don't even start the hold timer if we're in cooldown
+                    if current_time - last_music_gesture_time <= music_gesture_cooldown:
+                        # We're in cooldown period, show remaining time
+                        remaining = round(music_gesture_cooldown - (current_time - last_music_gesture_time), 1)
+                        cv2.putText(frame, f"Cooldown: {remaining}s", (x_min, text_y + 40),
+                                    font, 0.9, (0, 165, 255), 2, cv2.LINE_AA)
+                    else:
+                        # Past cooldown period, now handle the gesture states
+                        if rock_on_state == "none":
+                            # First detection of Rock On after cooldown
+                            rock_on_state = "holding"
+                            rock_on_start_time = current_time
+                            cv2.putText(frame, "Hold for play/pause...", (x_min, text_y + 40),
+                                        font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
                         
-                        # Add visual feedback for music toggle
-                        cv2.putText(frame, "Music Toggled!", (x_min, text_y + 40), 
-                                    font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                        elif rock_on_state == "holding":
+                            # Continuing to hold the Rock On gesture
+                            hold_time = current_time - rock_on_start_time
+                            
+                            if hold_time < rock_on_hold_threshold:
+                                # Still holding, but not long enough yet
+                                progress = int((hold_time / rock_on_hold_threshold) * 100)
+                                cv2.putText(frame, f"Hold: {progress}%", (x_min, text_y + 40),
+                                            font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                                
+                                # Draw progress bar
+                                bar_width = 100
+                                bar_height = 10
+                                bar_x = x_min
+                                bar_y = text_y + 60
+                                # Background bar (gray)
+                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
+                                            (100, 100, 100), -1)
+                                # Progress bar (yellow)
+                                progress_width = int((hold_time / rock_on_hold_threshold) * bar_width)
+                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), 
+                                            (0, 255, 255), -1)
+                            else:
+                                # Held long enough - trigger the media control
+                                play_pause_music()
+                                print("Music play/pause toggled")
+                                last_music_gesture_time = current_time
+                                rock_on_state = "triggered"
+                                
+                                # Add visual feedback for music toggle
+                                cv2.putText(frame, "Music Toggled!", (x_min, text_y + 40),
+                                            font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+                        
+                        elif rock_on_state == "triggered":
+                            # Already triggered, still showing the Rock On gesture
+                            cv2.putText(frame, "Command triggered", (x_min, text_y + 40),
+                                        font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
                 
                 previous_static_gesture = gesture
             else:
                 previous_static_gesture = None
+                # If no longer making Rock On gesture, reset the state
+                if gesture != "Rock On" and rock_on_state != "none":
+                    rock_on_state = "none"
 
             # Cursor control: if this is the first detected hand and it shows a "Fist" gesture,
             # use the center of the fist (the bounding box center) to slowly move the cursor.
