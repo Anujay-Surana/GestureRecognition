@@ -294,13 +294,12 @@ def process_frame(frame):
             last_volume_gesture_time = current_time
 
         if right_confirmed == "Rock On":
-            if not prev_rock_on and (current_time - last_music_gesture_time > music_gesture_cooldown):
+            if  (current_time - last_music_gesture_time > music_gesture_cooldown):
                 play_pause_music()
                 print("Music toggled")
                 last_music_gesture_time = current_time
-            prev_rock_on = True
         else:
-            prev_rock_on = False
+            pass
 
         if right_confirmed == "Open Palm" and (current_time - last_click_time > click_cooldown):
             click_action_generic()
