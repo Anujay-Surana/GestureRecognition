@@ -15,16 +15,15 @@ is_listening = False
 listening_active = False
 speech_recognition_thread = None
 wake_word = "hey adam"
-listening_timeout = 6  # seconds
+listening_timeout = 3  # seconds
 
 class WakeWordDetector:
-    def __init__(self, wake_word="hey adam", sensitivity=0.5, language="en-IN"):
+    def __init__(self, wake_word="hey adam", sensitivity=0.5):
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = 4000  # Adjust this based on your environment
         self.recognizer.dynamic_energy_threshold = True
         self.wake_word = wake_word.lower()
         self.sensitivity = sensitivity
-        self.language = language  # Language setting for accent recognition
         
         # Sound for feedback
         if os.path.exists("listening_start.wav"):
@@ -77,8 +76,7 @@ class WakeWordDetector:
                 try:
                     audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=3)
                     try:
-                        # Specify language for accent-specific recognition
-                        text = self.recognizer.recognize_google(audio, language=self.language).lower()
+                        text = self.recognizer.recognize_google(audio).lower()
                         print(f"Heard: {text}")
                         
                         if self.wake_word in text:
@@ -112,8 +110,7 @@ class WakeWordDetector:
                     audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=10)
                     
                     try:
-                        # Specify language for accent-specific recognition
-                        text = self.recognizer.recognize_google(audio, language=self.language)
+                        text = self.recognizer.recognize_google(audio)  # Keep original case for typing
                         print(f"Converting to keyboard input: {text}")
                         
                         # Add to speech queue for display
@@ -212,8 +209,8 @@ def start_speech_recognition():
     except Exception as e:
         print(f"Could not create feedback sounds: {e}")
     
-    # Initialize wake word detector with desired language accent
-    detector = WakeWordDetector(wake_word=wake_word, language="en-IN")
+    # Initialize wake word detector
+    detector = WakeWordDetector(wake_word=wake_word)
     
     # Start wake word detection in a background thread
     speech_recognition_thread = threading.Thread(target=detector.listen_for_wake_word)
