@@ -51,6 +51,7 @@ right_gesture_history = deque(maxlen=5)
 
 prev_point_position = None        # For right-hand pointer (cursor)
 prev_right_point_position = None  # For scrolling via right-hand pointer
+prev_scroll_dy = 0                # For smoothing scroll delta
 prev_rock_on = False
 
 # Speech recognition globals
@@ -200,7 +201,7 @@ def detect_static_gesture(hand_landmarks, frame):
     thumb_up = (thumb_tip.y < thumb_mcp.y - delta_thumb) and (abs((thumb_tip.x * w) - hand_center_x) < hand_width * 0.3)
     thumb_down = (thumb_tip.y > thumb_mcp.y + delta_thumb) and (abs((thumb_tip.x * w) - hand_center_x) < hand_width * 0.3)
 
-    # Define gestures
+    # Gesture definitions:
     if index_ext and middle_ext and ring_ext and pinky_ext:
         return "Open Palm"
     elif index_ext and middle_ext and (not ring_ext) and (not pinky_ext):
@@ -221,7 +222,7 @@ def detect_static_gesture(hand_landmarks, frame):
 # -----------------------
 def process_frame(frame):
     global last_volume_gesture_time, last_click_time, last_music_gesture_time
-    global last_speech_text, last_speech_time, prev_point_position, prev_right_point_position, prev_rock_on
+    global last_speech_text, last_speech_time, prev_point_position, prev_right_point_position, prev_rock_on, prev_scroll_dy
     global left_gesture_history, right_gesture_history
 
     current_time = time.time()
@@ -230,7 +231,7 @@ def process_frame(frame):
     results = hands.process(rgb_frame)
     h, w, _ = frame.shape
 
-    # Speech recognition overlay
+    # Speech overlay
     cv2.putText(frame, "Say 'Hey Adam' to activate speech recognition", 
                 (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
     if last_speech_text and (current_time - last_speech_time < speech_display_duration):
@@ -242,7 +243,7 @@ def process_frame(frame):
         cv2.putText(frame, text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
 
     # Gesture instructions overlay
-    cv2.putText(frame, "Vol Up/Down: Thumbs | Music: Rock On | Click: Open Palm | Cursor: Point | Scroll Mode: Left Peace + Right Point",
+    cv2.putText(frame, "Vol Up/Down: Thumbs | Music: Rock On | Click: Open Palm | Cursor: Point | Scroll: Left Peace + Right Point",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
     left_confirmed = None
@@ -272,7 +273,7 @@ def process_frame(frame):
                 if gesture == "Point":
                     right_index_tip = hand_landmarks.landmark[8]
         
-        # Confirm gestures with multi-frame smoothing (at least 3 of last 5 frames)
+        # Confirm gestures with multi-frame smoothing (need at least 3 of last 5 frames)
         if len(left_gesture_history) >= 3:
             candidate = max(set(left_gesture_history), key=left_gesture_history.count)
             if left_gesture_history.count(candidate) >= 3:
@@ -306,23 +307,31 @@ def process_frame(frame):
             print("Click action triggered")
             last_click_time = current_time
 
-        # Determine if scroll mode is active: left hand is "Peace" and right hand is "Point"
+        # Determine if scroll mode is active: left hand confirmed as "Peace" and right hand confirmed as "Point"
         scroll_mode = (left_confirmed == "Peace" and right_confirmed == "Point")
         if scroll_mode:
             cv2.putText(frame, "Scroll Mode Active", (10, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2, cv2.LINE_AA)
             if right_index_tip is not None:
                 current_right_point = (right_index_tip.x * w, right_index_tip.y * h)
+                # Smooth scrolling: apply a weighted average on the vertical delta
+                global prev_right_point_position, prev_scroll_dy
                 if prev_right_point_position is not None:
                     dy = current_right_point[1] - prev_right_point_position[1]
-                    scroll_amount = int(-dy * 2)  # Adjust scaling factor as needed
-                    if scroll_amount != 0:
+                    # Smooth the delta: combine previous smoothed value with current dy
+                    prev_scroll_dy = 0.8 * prev_scroll_dy + 0.2 * dy
+                    # Use a reduced multiplier to scroll more slowly
+                    scroll_amount = int(-prev_scroll_dy * 0.5)
+                    if abs(scroll_amount) >= 1:
                         pyautogui.scroll(scroll_amount)
                         print("Scrolling", scroll_amount)
+                else:
+                    prev_scroll_dy = 0
                 prev_right_point_position = current_right_point
         else:
             prev_right_point_position = None
+            prev_scroll_dy = 0
 
-        # If not in scroll mode and right hand is "Point", use its movement to control the cursor
+        # If not in scroll mode and right hand is confirmed as "Point", use its movement to control the cursor
         if (not scroll_mode) and (right_confirmed == "Point") and (right_index_tip is not None):
             screen_w, screen_h = get_screen_size()
             current_point = (right_index_tip.x * screen_w, right_index_tip.y * screen_h)
