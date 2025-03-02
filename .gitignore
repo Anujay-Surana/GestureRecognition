@@ -38,3 +38,12 @@ logs/
 
 # Dependencies
 frontend/node_modules/
+
+# Backend
+backend/venv/
+backend/env/
+backend/ENV/
+backend/.env
+backend/.venv
+backend/env.bak/
+backend/__pycache__/
