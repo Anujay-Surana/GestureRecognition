@@ -13,7 +13,6 @@ from collections import deque
 import threading
 import pyautogui
 
-# Speech recognition and keyboard control imports
 from audio import start_speech_recognition, get_recognized_speech
 
 app = FastAPI()
@@ -25,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize MediaPipe Hands and Drawing Utilities
+# Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -35,20 +34,20 @@ hands = mp_hands.Hands(
 )
 mp_drawing = mp.solutions.drawing_utils
 
-# Global variables for gesture control and smoothing
+# Global variables for smoothing
 last_volume_gesture_time = 0
 volume_gesture_cooldown = 1.0 if platform.system() == "Windows" else 0.3
 last_music_gesture_time = 0
-music_gesture_cooldown = 2.0  # seconds
+music_gesture_cooldown = 2.0
 last_click_time = 0
-click_cooldown = 1.0  # seconds
+click_cooldown = 1.0
 
-# Separate gesture history for left and right hands
 left_gesture_history = deque(maxlen=5)
 right_gesture_history = deque(maxlen=5)
 
-prev_point_position = None        # For right-hand pointer (cursor)
-prev_right_point_position = None  # For scrolling via right-hand pointer
+# Prev positions for cursor and scrolling
+prev_point_position = None
+prev_right_point_position = None
 prev_rock_on = False
 
 # Speech recognition globals
@@ -328,7 +327,7 @@ def process_frame(frame):
                 current_right_point = (right_index_tip.x * w, right_index_tip.y * h)
                 if prev_right_point_position is not None:
                     dy = current_right_point[1] - prev_right_point_position[1]
-                    scroll_amount = int(-dy * 2)  # Adjust scaling factor as needed
+                    scroll_amount = int(-dy * 3.5)  # Adjust scaling factor as needed
                     if scroll_amount != 0:
                         pyautogui.scroll(scroll_amount)
                         print("Scrolling", scroll_amount)
