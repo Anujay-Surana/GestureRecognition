@@ -15,7 +15,7 @@ is_listening = False
 listening_active = False
 speech_recognition_thread = None
 wake_word = "hey adam"
-listening_timeout = 1.5  # seconds
+listening_timeout = 3  # seconds
 
 class WakeWordDetector:
     def __init__(self, wake_word="hey adam", sensitivity=0.5):
@@ -96,7 +96,7 @@ class WakeWordDetector:
                     pass
                     
     def listen_for_speech(self):
-        """Listen for speech after wake word is detected"""
+        """Listen for speech after wake word is detected and convert to keyboard input"""
         global is_listening, listening_active, speech_queue
         
         with sr.Microphone() as source:
@@ -106,14 +106,19 @@ class WakeWordDetector:
             
             while listening_active:
                 try:
-                    print("Listening for speech...")
+                    print("Listening for speech input...")
                     audio = self.recognizer.listen(source, timeout=1, phrase_time_limit=10)
                     
                     try:
-                        text = self.recognizer.recognize_google(audio).lower()
-                        print(f"Transcript: {text}")
+                        text = self.recognizer.recognize_google(audio)  # Keep original case for typing
+                        print(f"Converting to keyboard input: {text}")
+                        
+                        # Add to speech queue for display
                         speech_queue.put(text)
                         last_speech_time = time.time()
+                        
+                        # Convert to keyboard input
+                        speech_to_keyboard(text)
                         
                     except sr.UnknownValueError:
                         # Check for timeout - stop listening if silence for too long

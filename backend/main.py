@@ -15,8 +15,6 @@ import pyautogui
 
 # Speech recognition and keyboard control imports
 from audio import start_speech_recognition, get_recognized_speech
-from speechtokey import speech_to_keyboard
-from updatedspeech import update_speech_recognition
 
 app = FastAPI()
 app.add_middleware(
@@ -51,10 +49,10 @@ right_gesture_history = deque(maxlen=5)
 
 prev_point_position = None        # For right-hand pointer (cursor)
 prev_right_point_position = None  # For scrolling via right-hand pointer
-prev_scroll_dy = 0                # For smoothing scroll delta
 prev_rock_on = False
 
 # Speech recognition globals
+speech_recognition_active = False
 last_speech_text = None
 last_speech_time = 0
 speech_display_duration = 5.0  # seconds
@@ -201,7 +199,7 @@ def detect_static_gesture(hand_landmarks, frame):
     thumb_up = (thumb_tip.y < thumb_mcp.y - delta_thumb) and (abs((thumb_tip.x * w) - hand_center_x) < hand_width * 0.3)
     thumb_down = (thumb_tip.y > thumb_mcp.y + delta_thumb) and (abs((thumb_tip.x * w) - hand_center_x) < hand_width * 0.3)
 
-    # Gesture definitions:
+    # Define gestures
     if index_ext and middle_ext and ring_ext and pinky_ext:
         return "Open Palm"
     elif index_ext and middle_ext and (not ring_ext) and (not pinky_ext):
@@ -222,7 +220,7 @@ def detect_static_gesture(hand_landmarks, frame):
 # -----------------------
 def process_frame(frame):
     global last_volume_gesture_time, last_click_time, last_music_gesture_time
-    global last_speech_text, last_speech_time, prev_point_position, prev_right_point_position, prev_rock_on, prev_scroll_dy
+    global last_speech_text, last_speech_time, prev_point_position, prev_right_point_position, prev_rock_on
     global left_gesture_history, right_gesture_history
 
     current_time = time.time()
@@ -231,19 +229,34 @@ def process_frame(frame):
     results = hands.process(rgb_frame)
     h, w, _ = frame.shape
 
-    # Speech overlay
-    cv2.putText(frame, "Say 'Hey Adam' to activate speech recognition", 
-                (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+    new_speech = get_recognized_speech()
+    if new_speech:
+        last_speech_text = new_speech
+        last_speech_time = current_time
+        print(f"New speech recognized: {new_speech}")
+
+    # Display speech recognition status and results
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # Display wake word instruction
+    cv2.putText(frame, "Say 'Hey Adam' to activate speech recognition", (10, h - 60), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    # Display the recognized speech if it's recent
     if last_speech_text and (current_time - last_speech_time < speech_display_duration):
+        # Display recognition result with a background
         text = f"Speech: {last_speech_text}"
-        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        text_size = cv2.getTextSize(text, font, 0.7, 2)[0]
+        
+        # Draw semi-transparent background for text
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, h - 40), (10 + text_size[0] + 20, h - 10), (0,0,0), -1)
+        cv2.rectangle(overlay, (10, h - 40), (10 + text_size[0] + 20, h - 10), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-        cv2.putText(frame, text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+        
+        cv2.putText(frame, text, (20, h - 20), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
 
     # Gesture instructions overlay
-    cv2.putText(frame, "Vol Up/Down: Thumbs | Music: Rock On | Click: Open Palm | Cursor: Point | Scroll: Left Peace + Right Point",
+    cv2.putText(frame, "Vol Up/Down: Thumbs | Music: Rock On | Click: Open Palm | Cursor: Point | Scroll Mode: Left Peace + Right Point",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
     left_confirmed = None
@@ -273,7 +286,7 @@ def process_frame(frame):
                 if gesture == "Point":
                     right_index_tip = hand_landmarks.landmark[8]
         
-        # Confirm gestures with multi-frame smoothing (need at least 3 of last 5 frames)
+        # Confirm gestures with multi-frame smoothing (at least 3 of last 5 frames)
         if len(left_gesture_history) >= 3:
             candidate = max(set(left_gesture_history), key=left_gesture_history.count)
             if left_gesture_history.count(candidate) >= 3:
@@ -294,43 +307,36 @@ def process_frame(frame):
             last_volume_gesture_time = current_time
 
         if right_confirmed == "Rock On":
-            if  (current_time - last_music_gesture_time > music_gesture_cooldown):
+            if not prev_rock_on and (current_time - last_music_gesture_time > music_gesture_cooldown):
                 play_pause_music()
                 print("Music toggled")
                 last_music_gesture_time = current_time
+            prev_rock_on = True
         else:
-            pass
+            prev_rock_on = False
 
         if right_confirmed == "Open Palm" and (current_time - last_click_time > click_cooldown):
             click_action_generic()
             print("Click action triggered")
             last_click_time = current_time
 
-        # Determine if scroll mode is active: left hand confirmed as "Peace" and right hand confirmed as "Point"
+        # Determine if scroll mode is active: left hand is "Peace" and right hand is "Point"
         scroll_mode = (left_confirmed == "Peace" and right_confirmed == "Point")
         if scroll_mode:
             cv2.putText(frame, "Scroll Mode Active", (10, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2, cv2.LINE_AA)
             if right_index_tip is not None:
                 current_right_point = (right_index_tip.x * w, right_index_tip.y * h)
-                # Smooth scrolling: apply a weighted average on the vertical delta
-                global prev_right_point_position, prev_scroll_dy
                 if prev_right_point_position is not None:
                     dy = current_right_point[1] - prev_right_point_position[1]
-                    # Smooth the delta: combine previous smoothed value with current dy
-                    prev_scroll_dy = 0.8 * prev_scroll_dy + 0.2 * dy
-                    # Use a reduced multiplier to scroll more slowly
-                    scroll_amount = int(-prev_scroll_dy * 0.5)
-                    if abs(scroll_amount) >= 1:
+                    scroll_amount = int(-dy * 2)  # Adjust scaling factor as needed
+                    if scroll_amount != 0:
                         pyautogui.scroll(scroll_amount)
                         print("Scrolling", scroll_amount)
-                else:
-                    prev_scroll_dy = 0
                 prev_right_point_position = current_right_point
         else:
             prev_right_point_position = None
-            prev_scroll_dy = 0
 
-        # If not in scroll mode and right hand is confirmed as "Point", use its movement to control the cursor
+        # If not in scroll mode and right hand is "Point", use its movement to control the cursor
         if (not scroll_mode) and (right_confirmed == "Point") and (right_index_tip is not None):
             screen_w, screen_h = get_screen_size()
             current_point = (right_index_tip.x * screen_w, right_index_tip.y * screen_h)
@@ -385,7 +391,14 @@ async def root():
 async def video_feed():
     return StreamingResponse(generate_frames(), media_type='multipart/x-mixed-replace; boundary=frame')
 
+@app.on_event("startup")
+async def startup_event():
+    
+    # Start speech recognition in a background thread
+    threading.Thread(target=start_speech_recognition, daemon=True).start()
+    print("Speech recognition initialized with wake word: 'Hey Adam'")
+    print("Speech will now be converted to keyboard input")
+
+
 if __name__ == '__main__':
-    update_speech_recognition()
-    start_speech_recognition()
     uvicorn.run(app, host="0.0.0.0", port=8001)
