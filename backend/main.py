@@ -9,9 +9,16 @@ import ctypes
 import time
 from fastapi.responses import StreamingResponse
 import uvicorn
+from collections import deque
+import threading
 
 # For macOS cursor control via pyautogui
 import pyautogui
+
+# Import the speech recognition module
+from audio import start_speech_recognition, get_recognized_speech
+from speechtokey import speech_to_keyboard
+from updatedspeech import update_speech_recognition
 
 app = FastAPI()
 
@@ -34,44 +41,50 @@ hands = mp_hands.Hands(
 )
 mp_drawing = mp.solutions.drawing_utils
 
-# Global variables for gesture control
+# Global variables for gesture control and smoothing
 last_volume_gesture_time = 0
-volume_gesture_cooldown = 1  # seconds
-previous_static_gesture = None  # To avoid repeated volume commands
+# Set a longer cooldown on Windows (1.0 sec) to slow down volume changes;
+# on macOS use a shorter delay (0.3 sec)
+volume_gesture_cooldown = 1.0 if platform.system() == "Windows" else 0.3
 
-previous_hand_center = None
-dynamic_gesture_last_time = 0
-dynamic_gesture_cooldown = 1  # seconds
-
-previous_cursor_center = None  # Used for cursor control with fist
-
-# Added for Rock On gesture for music control
 last_music_gesture_time = 0
-music_gesture_cooldown = 3.0  # Increased to 3 seconds
-rock_on_start_time = 0  # When the Rock On gesture was first detected
-rock_on_hold_threshold = 1.5  # Hold the gesture for 1.5 seconds to activate
-rock_on_state = "none"  # Track the state of rock on detection: "none", "holding", "triggered"
+music_gesture_cooldown = 2.0  # seconds
 
-# Detect platform
-current_platform = platform.system()
+last_click_time = 0
+click_cooldown = 1.0  # seconds for click action
+
+# For dynamic gesture velocity calculation
+previous_hand_center = None
+previous_dynamic_time = None
+
+# Smoothing histories (last 5 frames)
+static_gesture_history = deque(maxlen=5)
+dynamic_gesture_history = deque(maxlen=5)
+
+# Speech recognition globals
+speech_recognition_active = False
+last_speech_text = None
+last_speech_time = 0
+speech_display_duration = 5.0  # Display recognized speech for 5 seconds
 
 # -----------------------
-# Media Control Functions
+# Media & OS Control Functions
 # -----------------------
-
-if current_platform == "Windows":
-    # Volume control functions for Windows using ctypes
+if platform.system() == "Windows":
+    # Use keybd_event to simulate key presses for volume control on Windows.
     def volume_up_windows():
-        HWND_BROADCAST = 0xFFFF
-        WM_APPCOMMAND = 0x0319
-        APPCOMMAND_VOLUME_UP = 0x0a
-        ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_APPCOMMAND, 0, APPCOMMAND_VOLUME_UP << 16)
+        VK_VOLUME_UP = 0xAF
+        KEYEVENTF_EXTENDEDKEY = 0x1
+        KEYEVENTF_KEYUP = 0x2
+        ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, KEYEVENTF_EXTENDEDKEY, 0)
+        ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
 
     def volume_down_windows():
-        HWND_BROADCAST = 0xFFFF
-        WM_APPCOMMAND = 0x0319
-        APPCOMMAND_VOLUME_DOWN = 0x09
-        ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_APPCOMMAND, 0, APPCOMMAND_VOLUME_DOWN << 16)
+        VK_VOLUME_DOWN = 0xAE
+        KEYEVENTF_EXTENDEDKEY = 0x1
+        KEYEVENTF_KEYUP = 0x2
+        ctypes.windll.user32.keybd_event(VK_VOLUME_DOWN, 0, KEYEVENTF_EXTENDEDKEY, 0)
+        ctypes.windll.user32.keybd_event(VK_VOLUME_DOWN, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
         
     def play_pause_music_windows():
         HWND_BROADCAST = 0xFFFF
@@ -81,13 +94,17 @@ if current_platform == "Windows":
 
     def minimize_current_window():
         hwnd = ctypes.windll.user32.GetForegroundWindow()
-        # 6 minimizes the window
         ctypes.windll.user32.ShowWindow(hwnd, 6)
 
     def maximize_current_window():
         hwnd = ctypes.windll.user32.GetForegroundWindow()
-        # 3 maximizes the window
         ctypes.windll.user32.ShowWindow(hwnd, 3)
+
+    def click_action_windows():
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     def volume_up():
         volume_up_windows()
@@ -98,20 +115,15 @@ if current_platform == "Windows":
     def play_pause_music():
         play_pause_music_windows()
 
-    # Cursor control for Windows using ctypes (win32 API)
+    # Cursor control using absolute positioning.
     import ctypes.wintypes
-    def move_cursor_windows(dx, dy):
-        current_pos = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(current_pos))
-        new_x = current_pos.x + int(dx)
-        new_y = current_pos.y + int(dy)
-        ctypes.windll.user32.SetCursorPos(new_x, new_y)
+    def move_cursor_absolute_windows(x, y):
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
 
-    def move_cursor(dx, dy):
-        move_cursor_windows(dx, dy)
+    def move_cursor_absolute(x, y):
+        move_cursor_absolute_windows(x, y)
 
-elif current_platform == "Darwin":
-    # Volume control functions for macOS using AppleScript
+elif platform.system() == "Darwin":
     def volume_up_mac():
         try:
             current_volume = subprocess.check_output("osascript -e 'output volume of (get volume settings)'", shell=True)
@@ -131,7 +143,6 @@ elif current_platform == "Darwin":
         subprocess.run(f"osascript -e 'set volume output volume {new_volume}'", shell=True)
         
     def play_pause_music_mac():
-        # Using AppleScript to send play/pause to the current music app
         subprocess.run("osascript -e 'tell application \"System Events\" to keystroke space'", shell=True)
 
     def minimize_current_window():
@@ -139,6 +150,9 @@ elif current_platform == "Darwin":
 
     def maximize_current_window():
         print("Maximize window not implemented on macOS in this example.")
+
+    def click_action_mac():
+        pyautogui.click()
 
     def volume_up():
         volume_up_mac()
@@ -149,16 +163,12 @@ elif current_platform == "Darwin":
     def play_pause_music():
         play_pause_music_mac()
 
-    # Cursor control for macOS using pyautogui
-    def move_cursor_mac(dx, dy):
-        current_x, current_y = pyautogui.position()
-        new_x = current_x + int(dx)
-        new_y = current_y + int(dy)
-        # Slow movement using a short duration
-        pyautogui.moveTo(new_x, new_y, duration=0.2)
+    # Cursor control for macOS using pyautogui (absolute positioning)
+    def move_cursor_absolute_mac(x, y):
+        pyautogui.moveTo(x, y, duration=0.1)
 
-    def move_cursor(dx, dy):
-        move_cursor_mac(dx, dy)
+    def move_cursor_absolute(x, y):
+        move_cursor_absolute_mac(x, y)
 
 else:
     def volume_up():
@@ -171,101 +181,182 @@ else:
         print("Window minimize not supported on this platform")
     def maximize_current_window():
         print("Window maximize not supported on this platform")
-    def move_cursor(dx, dy):
+    def click_action():
+        print("Click action not supported on this platform")
+    def move_cursor_absolute(x, y):
         print("Cursor control not supported on this platform")
+
+def click_action_generic():
+    if platform.system() == "Windows":
+        click_action_windows()
+    elif platform.system() == "Darwin":
+        click_action_mac()
+
+def get_screen_size():
+    if platform.system() == "Windows":
+        user32 = ctypes.windll.user32
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    elif platform.system() == "Darwin":
+        size = pyautogui.size()
+        return size.width, size.height
+    else:
+        return 800, 600
+
 
 # -----------------------
 # Gesture Detection Functions
 # -----------------------
 def detect_static_gesture(hand_landmarks, frame):
     """
-    Detects static gestures using finger extension and thumb angle.
+    Detects static gestures using refined finger and thumb positions.
     Recognizes:
-      - "Open Palm": All four non-thumb fingers extended.
-      - "Fist": All four non-thumb fingers folded.
-      - "Thumbs Up": All non-thumb fingers folded and thumb pointing upward.
-      - "Thumbs Down": All non-thumb fingers folded and thumb pointing downward.
-      - "Rock On": Index and pinky fingers extended, other fingers folded.
+      - "Rock On": Index and pinky clearly extended; middle and ring clearly folded.
+      - "Open Palm": All four non-thumb fingers clearly extended. (Now used for click action.)
+      - "Thumbs Up": All non-thumb fingers clearly folded and thumb clearly up.
+      - "Thumbs Down": All non-thumb fingers clearly folded and thumb clearly down.
+      - "Point": Index extended while middle, ring, pinky, and thumb are clearly folded.
+      - "Unrecognized": When no clear gesture is detected.
     """
     landmarks = hand_landmarks.landmark
     h, w, _ = frame.shape
 
-    def finger_extended(tip_idx, pip_idx):
-        return landmarks[tip_idx].y < landmarks[pip_idx].y
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    x_min = min(xs) * w
+    x_max = max(xs) * w
+    y_min = min(ys) * h
+    y_max = max(ys) * h
+    hand_center_x = (x_min + x_max) / 2
+    hand_center_y = (y_min + y_max) / 2
+    hand_width = x_max - x_min
 
-    # Check extension of each finger
-    index_extended = finger_extended(8, 6)
-    middle_extended = finger_extended(12, 10)
-    ring_extended = finger_extended(16, 14)
-    pinky_extended = finger_extended(20, 18)
-    
-    # Calculate thumb position for thumb gestures
-    thumb_mcp = landmarks[2]
-    thumb_tip = landmarks[4]
-    dx = thumb_tip.x - thumb_mcp.x
-    dy = thumb_tip.y - thumb_mcp.y
-    angle = math.degrees(math.atan2(dy, dx))
-    threshold_angle = 20  # degrees tolerance
-    
-    # Rock On gesture: index and pinky extended, others folded
-    if index_extended and not middle_extended and not ring_extended and pinky_extended:
-        return "Rock On"
-    
-    # Open Palm: all four fingers extended
-    elif index_extended and middle_extended and ring_extended and pinky_extended:
-        return "Open Palm"
-    
-    # Fist, Thumbs Up, Thumbs Down: no fingers extended, thumb position matters
-    elif not index_extended and not middle_extended and not ring_extended and not pinky_extended:
-        if thumb_tip.y < thumb_mcp.y and abs(angle + 90) < threshold_angle:
-            return "Thumbs Up"
-        elif thumb_tip.y > thumb_mcp.y and abs(angle - 90) < threshold_angle:
-            return "Thumbs Down"
+    def finger_extended(tip_idx, pip_idx, delta=0.05):
+        # Calculate hand size to adapt sensitivity based on distance
+        hand_size = (x_max - x_min) * (y_max - y_min)
+        screen_size = w * h
+        hand_ratio = hand_size / screen_size
+        
+        # Adjust threshold based on distance (smaller delta for far distances)
+        if hand_ratio < 0.05:  # Hand is far away
+            adjusted_delta = delta * 0.6  # More sensitive for far distances
         else:
-            return "Fist"
+            adjusted_delta = delta
+            
+        return landmarks[tip_idx].y < (landmarks[pip_idx].y - adjusted_delta)
+
+    def finger_folded(tip_idx, pip_idx, margin=0.02):
+        return landmarks[tip_idx].y > (landmarks[pip_idx].y + margin)
+
+    index_ext = finger_extended(8, 6)
+    middle_ext = finger_extended(12, 10)
+    ring_ext = finger_extended(16, 14)
+    pinky_ext = finger_extended(20, 18)
+
+    middle_folded = finger_folded(12, 10)
+    ring_folded = finger_folded(16, 14)
+    pinky_folded = finger_folded(20, 18)
+
+    # Improved thumb detection
+    thumb_mcp = landmarks[2]
+    thumb_ip = landmarks[3]  # Interphalangeal joint
+    thumb_tip = landmarks[4]
     
-    # None of the above patterns matched
+    # Make thumb detection more lenient
+    delta_thumb = 0.025  # Reduced from 0.03
+    
+    # Broader position check for thumb up
+    thumb_up = (thumb_tip.y < thumb_mcp.y - delta_thumb) and (abs((thumb_tip.x * w) - hand_center_x) < hand_width * 0.3)
+    
+    # Broader position check for thumb down
+    thumb_down = (thumb_tip.y > thumb_mcp.y + delta_thumb) and (abs((thumb_tip.x * w) - hand_center_x) < hand_width * 0.3)
+    
+    thumb_folded = not (thumb_up or thumb_down)
+
+    # Priority: Rock On, then Open Palm (for click), then Thumbs Up/Down, then Point
+    if index_ext and pinky_ext and middle_folded and ring_folded:
+        return "Rock On"
+    elif index_ext and middle_ext and ring_ext and pinky_ext:
+        return "Open Palm"
+    # More lenient check for Thumbs Up - only requiring most fingers to be non-extended
+    elif (sum([index_ext, middle_ext, ring_ext, pinky_ext]) <= 1) and thumb_up:
+        return "Thumbs Up"
+    # More lenient check for Thumbs Down - only requiring most fingers to be non-extended
+    elif (sum([index_ext, middle_ext, ring_ext, pinky_ext]) <= 1) and thumb_down:
+        return "Thumbs Down"
+    # Enhanced point detection with adaptive thresholds for distance
+    elif index_ext and not (middle_ext and ring_ext and pinky_ext):
+        # Calculate hand size to estimate distance
+        hand_size = (x_max - x_min) * (y_max - y_min)
+        screen_size = w * h
+        hand_ratio = hand_size / screen_size
+        
+        # For far distances (small hand ratio), be more lenient
+        if hand_ratio < 0.05:  # Hand is far away
+            # Just check if index is the most extended finger
+            finger_heights = [
+                landmarks[8].y,  # index tip
+                landmarks[12].y, # middle tip
+                landmarks[16].y, # ring tip
+                landmarks[20].y  # pinky tip
+            ]
+            if finger_heights[0] == min(finger_heights):  # Index is highest/most extended
+                return "Point"
+        else:
+            # Normal point detection for closer distances
+            if not middle_ext and not ring_ext and not pinky_ext:
+                return "Point"
     else:
-        return None
+        return "Unrecognized"
 
 def detect_dynamic_gesture(bbox, current_time):
     """
-    Detects dynamic (swipe) gestures based on the movement of the hand's center.
-    Compares the current center with the previous center.
+    Detects dynamic (swipe) gestures based on hand center movement.
+    Uses displacement and velocity thresholds.
     """
-    global previous_hand_center, dynamic_gesture_last_time
-
+    global previous_hand_center, previous_dynamic_time
     x_min, y_min, x_max, y_max = bbox
     current_center = ((x_min + x_max) // 2, (y_min + y_max) // 2)
+    hand_width = x_max - x_min
+    displacement_threshold = hand_width * 0.3
+
+    if previous_hand_center is None or previous_dynamic_time is None:
+        previous_hand_center = current_center
+        previous_dynamic_time = current_time
+        return None
+
+    dt = current_time - previous_dynamic_time
+    if dt <= 0:
+        dt = 0.033
+
+    dx = current_center[0] - previous_hand_center[0]
+    dy = current_center[1] - previous_hand_center[1]
+    velocity_x = dx / dt
+    velocity_y = dy / dt
+    velocity_threshold = 500
 
     dynamic_gesture = None
-    if previous_hand_center is not None and (current_time - dynamic_gesture_last_time > dynamic_gesture_cooldown):
-        dx = current_center[0] - previous_hand_center[0]
-        dy = current_center[1] - previous_hand_center[1]
-        threshold = 50  # pixel movement threshold
-
-        if abs(dx) > abs(dy):
-            if dx > threshold:
-                dynamic_gesture = "Swipe Right"
-            elif dx < -threshold:
-                dynamic_gesture = "Swipe Left"
-        else:
-            if dy > threshold:
-                dynamic_gesture = "Swipe Down"
-            elif dy < -threshold:
-                dynamic_gesture = "Swipe Up"
-        if dynamic_gesture:
-            dynamic_gesture_last_time = current_time
+    if abs(dx) > abs(dy):
+        if dx > displacement_threshold and velocity_x > velocity_threshold:
+            dynamic_gesture = "Swipe Right"
+        elif dx < -displacement_threshold and velocity_x < -velocity_threshold:
+            dynamic_gesture = "Swipe Left"
+    else:
+        if dy > displacement_threshold and velocity_y > velocity_threshold:
+            dynamic_gesture = "Swipe Down"
+        elif dy < -displacement_threshold and velocity_y < -velocity_threshold:
+            dynamic_gesture = "Swipe Up"
 
     previous_hand_center = current_center
+    previous_dynamic_time = current_time
     return dynamic_gesture
 
 # -----------------------
 # Frame Processing Function
 # -----------------------
 def process_frame(frame):
-    global last_volume_gesture_time, previous_static_gesture, previous_cursor_center
-    global last_music_gesture_time, rock_on_start_time, rock_on_state
+    global last_volume_gesture_time, last_click_time, last_music_gesture_time
+    global last_speech_text, last_speech_time
+
     current_time = time.time()
     frame = cv2.flip(frame, 1)
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -273,17 +364,48 @@ def process_frame(frame):
     bbox_for_dynamic = None
     h, w, _ = frame.shape
 
-    # Add instruction text at the top of the frame
+    # Check for any new speech recognition results
+    new_speech = get_recognized_speech()
+    if new_speech:
+        last_speech_text = new_speech
+        last_speech_time = current_time
+        print(f"New speech recognized: {new_speech}")
+
+    # Display speech recognition status and results
     font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(frame, "Thumbs Up: Volume Up | Open Palm: Volume Down | Rock On: Play/Pause", 
+    
+    # Display wake word instruction
+    cv2.putText(frame, "Say 'Hey Adam' to activate speech recognition", 
+                (10, h - 60), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    # Display the recognized speech if it's recent
+    if last_speech_text and (current_time - last_speech_time < speech_display_duration):
+        # Display recognition result with a background
+        text = f"Speech: {last_speech_text}"
+        text_size = cv2.getTextSize(text, font, 0.7, 2)[0]
+        
+        # Draw semi-transparent background for text
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, h - 40), (10 + text_size[0] + 20, h - 10), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        
+        cv2.putText(frame, text, (20, h - 20), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Gesture instruction overlay
+    cv2.putText(frame, "Thumbs Up: Vol + | Thumbs Down: Vol - | Rock On: Music | Point: Cursor | Open Palm: Click", 
                 (10, 30), font, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Gesture detection and control
+    # [Rest of the gesture processing code remains the same]
+    
+    # Rest of the existing frame processing code
+    first_hand_confirmed_gesture = None
+    index_finger_tip = None  # for cursor control ("Point")
 
     if results.multi_hand_landmarks:
         for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-            # Draw landmarks and connections
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             
-            # Compute bounding box for the hand
             x_coords = [lm.x for lm in hand_landmarks.landmark]
             y_coords = [lm.y for lm in hand_landmarks.landmark]
             x_min = int(min(x_coords) * w)
@@ -292,118 +414,89 @@ def process_frame(frame):
             y_max = int(max(y_coords) * h)
             cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
             
-            # Use the first detected hand for dynamic gestures.
             if idx == 0:
                 bbox_for_dynamic = (x_min, y_min, x_max, y_max)
             
-            # Detect static gesture for this hand.
             gesture = detect_static_gesture(hand_landmarks, frame)
             if gesture:
-                # Overlay the static gesture name on the frame.
                 text_y = y_min - 10 if y_min - 10 > 20 else y_min + 30
                 cv2.putText(frame, gesture, (x_min, text_y), font, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
-                
-                # Handle volume control gestures
-                if gesture in ["Thumbs Up", "Open Palm"]:
-                    if previous_static_gesture != gesture and (current_time - last_volume_gesture_time > volume_gesture_cooldown):
-                        if gesture == "Thumbs Up":
-                            volume_up()
-                            print("Volume increased")
-                        elif gesture == "Open Palm":
-                            volume_down()
-                            print("Volume decreased")
-                        last_volume_gesture_time = current_time
-                
-                # Handle Rock On gesture for music play/pause with hold detection
-                elif gesture == "Rock On":
-                    # Check cooldown first - don't even start the hold timer if we're in cooldown
-                    if current_time - last_music_gesture_time <= music_gesture_cooldown:
-                        # We're in cooldown period, show remaining time
-                        remaining = round(music_gesture_cooldown - (current_time - last_music_gesture_time), 1)
-                        cv2.putText(frame, f"Cooldown: {remaining}s", (x_min, text_y + 40),
-                                    font, 0.9, (0, 165, 255), 2, cv2.LINE_AA)
+            
+            # [Rest of the existing gesture processing code]
+            if idx == 0:
+                if gesture is not None:
+                    static_gesture_history.append(gesture)
+                else:
+                    static_gesture_history.clear()
+
+                if len(static_gesture_history) >= 3:
+                    candidate = max(set(static_gesture_history), key=static_gesture_history.count)
+                    if static_gesture_history.count(candidate) >= 3:
+                        first_hand_confirmed_gesture = candidate
                     else:
-                        # Past cooldown period, now handle the gesture states
-                        if rock_on_state == "none":
-                            # First detection of Rock On after cooldown
-                            rock_on_state = "holding"
-                            rock_on_start_time = current_time
-                            cv2.putText(frame, "Hold for play/pause...", (x_min, text_y + 40),
-                                        font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-                        
-                        elif rock_on_state == "holding":
-                            # Continuing to hold the Rock On gesture
-                            hold_time = current_time - rock_on_start_time
-                            
-                            if hold_time < rock_on_hold_threshold:
-                                # Still holding, but not long enough yet
-                                progress = int((hold_time / rock_on_hold_threshold) * 100)
-                                cv2.putText(frame, f"Hold: {progress}%", (x_min, text_y + 40),
-                                            font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-                                
-                                # Draw progress bar
-                                bar_width = 100
-                                bar_height = 10
-                                bar_x = x_min
-                                bar_y = text_y + 60
-                                # Background bar (gray)
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
-                                            (100, 100, 100), -1)
-                                # Progress bar (yellow)
-                                progress_width = int((hold_time / rock_on_hold_threshold) * bar_width)
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), 
-                                            (0, 255, 255), -1)
-                            else:
-                                # Held long enough - trigger the media control
-                                play_pause_music()
-                                print("Music play/pause toggled")
-                                last_music_gesture_time = current_time
-                                rock_on_state = "triggered"
-                                
-                                # Add visual feedback for music toggle
-                                cv2.putText(frame, "Music Toggled!", (x_min, text_y + 40),
-                                            font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-                        
-                        elif rock_on_state == "triggered":
-                            # Already triggered, still showing the Rock On gesture
-                            cv2.putText(frame, "Command triggered", (x_min, text_y + 40),
-                                        font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-                
-                previous_static_gesture = gesture
-            else:
-                previous_static_gesture = None
-                # If no longer making Rock On gesture, reset the state
-                if gesture != "Rock On" and rock_on_state != "none":
-                    rock_on_state = "none"
+                        first_hand_confirmed_gesture = None
+                else:
+                    first_hand_confirmed_gesture = None
 
-            # Cursor control: if this is the first detected hand and it shows a "Fist" gesture,
-            # use the center of the fist (the bounding box center) to slowly move the cursor.
-            if idx == 0 and gesture == "Fist":
-                fist_center = ((x_min + x_max) // 2, (y_min + y_max) // 2)
-                if previous_cursor_center is not None:
-                    dx = fist_center[0] - previous_cursor_center[0]
-                    dy = fist_center[1] - previous_cursor_center[1]
-                    # Scale the movement so the cursor moves slowly (like a TV remote)
-                    scale_factor = 0.5
-                    move_cursor(dx * scale_factor, dy * scale_factor)
-                previous_cursor_center = fist_center
-            else:
-                previous_cursor_center = None
+                # For cursor control ("Point"), get index finger tip (landmark 8)
+                if first_hand_confirmed_gesture == "Point":
+                    index_finger_tip = hand_landmarks.landmark[8]
 
-    # Dynamic gesture detection (swipe gestures)
+                # Volume control: Thumbs Up / Thumbs Down
+                if first_hand_confirmed_gesture == "Thumbs Up" and (current_time - last_volume_gesture_time > volume_gesture_cooldown):
+                    volume_up()
+                    print("Volume increased")
+                    last_volume_gesture_time = current_time
+                elif first_hand_confirmed_gesture == "Thumbs Down" and (current_time - last_volume_gesture_time > volume_gesture_cooldown):
+                    volume_down()
+                    print("Volume decreased")
+                    last_volume_gesture_time = current_time
+
+                # Music control: Rock On toggles media playback without affecting the video feed.
+                elif first_hand_confirmed_gesture == "Rock On" and (current_time - last_music_gesture_time > music_gesture_cooldown):
+                    play_pause_music()
+                    print("Music toggled")
+                    last_music_gesture_time = current_time
+                    cv2.putText(frame, "Music Toggled!", (x_min, text_y + 40), font, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+
+                # Click action triggered by Open Palm
+                elif first_hand_confirmed_gesture == "Open Palm" and (current_time - last_click_time > click_cooldown):
+                    click_action_generic()
+                    print("Click action triggered")
+                    last_click_time = current_time
+
+    # Dynamic gesture detection (swipe gestures) with smoothing/velocity check.
     if bbox_for_dynamic is not None:
-        dynamic_gesture = detect_dynamic_gesture(bbox_for_dynamic, current_time)
-        if dynamic_gesture:
-            x_min, y_min, _, _ = bbox_for_dynamic
-            cv2.putText(frame, dynamic_gesture, (x_min, y_min - 50),
+        dynamic = detect_dynamic_gesture(bbox_for_dynamic, current_time)
+        if dynamic is not None:
+            dynamic_gesture_history.append(dynamic)
+        else:
+            dynamic_gesture_history.clear()
+
+        confirmed_dynamic = None
+        if len(dynamic_gesture_history) >= 3:
+            candidate_dynamic = max(set(dynamic_gesture_history), key=dynamic_gesture_history.count)
+            if dynamic_gesture_history.count(candidate_dynamic) >= 3:
+                confirmed_dynamic = candidate_dynamic
+
+        # Only trigger window control if not in cursor-control mode.
+        if confirmed_dynamic and first_hand_confirmed_gesture != "Point":
+            cv2.putText(frame, confirmed_dynamic, (bbox_for_dynamic[0], bbox_for_dynamic[1] - 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 0), 3, cv2.LINE_AA)
-            print(dynamic_gesture)
-            # Trigger window control based on dynamic gestures.
-            if dynamic_gesture == "Swipe Down":
+            print(confirmed_dynamic)
+            if confirmed_dynamic == "Swipe Down":
                 minimize_current_window()
-            elif dynamic_gesture == "Swipe Up":
+            elif confirmed_dynamic == "Swipe Up":
                 maximize_current_window()
-    
+            dynamic_gesture_history.clear()
+
+    # If "Point" is confirmed, move cursor based on index finger tip position.
+    if first_hand_confirmed_gesture == "Point" and index_finger_tip is not None:
+        screen_w, screen_h = get_screen_size()
+        abs_x = index_finger_tip.x * screen_w
+        abs_y = index_finger_tip.y * screen_h
+        move_cursor_absolute(abs_x, abs_y)
+
     return frame
 
 # -----------------------
@@ -430,15 +523,21 @@ def generate_frames():
 @app.get("/")
 async def root():
     return {
-        "message": "Gesture Control API",
+        "message": "Gesture and Speech Control API (Windows Optimized)",
         "instructions": "Access video feed at /video_feed",
         "gestures": {
             "Thumbs Up": "Increase volume",
-            "Open Palm": "Decrease volume",
+            "Thumbs Down": "Decrease volume",
             "Rock On": "Play/pause music",
-            "Fist": "Move cursor",
+            "Point": "Move cursor",
+            "Open Palm": "Click action",
             "Swipe Up": "Maximize window",
-            "Swipe Down": "Minimize window"
+            "Swipe Down": "Minimize window",
+            "Unrecognized": "No clear gesture detected"
+        },
+        "speech": {
+            "Wake word": "Hey Adam",
+            "Timeout": "3 seconds of silence",
         }
     }
 
@@ -448,6 +547,18 @@ async def video_feed():
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
+
+# Initialize the speech recognition when the server starts
+@app.on_event("startup")
+async def startup_event():
+    
+    # Update the speech recognition to include keyboard input functionality
+    update_speech_recognition()
+    
+    # Start speech recognition in a background thread
+    threading.Thread(target=start_speech_recognition, daemon=True).start()
+    print("Speech recognition initialized with wake word: 'Hey Adam'")
+    print("Speech will now be converted to keyboard input")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
